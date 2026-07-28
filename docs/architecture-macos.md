@@ -29,6 +29,7 @@ Native SwiftUI menu bar application that orchestrates meeting detection, recordi
                          │                  │  127.0.0.1:9876          │
                          │                  │  /state /healthz /metrics│
                          │                  │  /screenshot             │
+                         │                  │  /ui/tree /press /type   │
                          │                  │  /action/openSettings    │
                          │                  │  /action/closeSettings   │
                          │                  │  /v1/* (automation API)  │
@@ -128,6 +129,7 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `BrowserConsentPolicy.swift` | Pure decision logic for the browser-meeting "ask before recording" prompt — decline cooldown (issue #503) |
 | `ConsentPromptCoordinator.swift` | Coordinates an async yes/no recording-consent prompt: register pending decision by id, resolve once via answer or timeout |
 | `WatchLoop+Consent.swift` | Browser-meeting consent gate, split out of `WatchLoop`; only patterns with `requiresRecordingConsent` reach it |
+| `BrowserConsentReadiness.swift` | Pure decision logic for whether a browser-meeting consent prompt can actually reach the user (denied/provisional notifications make it silent) — backs the Settings → General warning |
 | `DualSourceRecorder.swift` | Orchestrates AudioTapLib capture + mic, mixes tracks |
 | `TranscribingEngine.swift` | `TranscribingEngine` protocol + `mergeDualSourceSegments` default impl |
 | `WhisperKitEngine.swift` | WhisperKit transcription engine (99+ languages, ~1 GB model) |
@@ -242,8 +244,11 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `DebugRPCServer+Metrics.swift` | `GET /metrics` handler — cumulative CPU/RAM/instruction counters via `proc_pid_rusage` |
 | `DebugRPCServer+Screenshot.swift` | `GET /screenshot` handler (PNG of the largest visible window via ScreenCaptureKit) |
 | `DebugRPCServer+UITree.swift` | `GET /ui/tree` handler — read-only accessibility tree of an allowlisted window |
-| `DebugRPCServer+UIPress.swift` | `POST /ui/press` handler — presses an allowlisted control via in-process `AXUIElementPerformAction` |
-| `DebugRPCServer+AXElement.swift` | Shared self-pid `AXUIElement` tree walk backing `/ui/tree` and `/ui/press` |
+| `DebugRPCServer+UIPress.swift` | `POST /ui/press` handler — presses an allowlisted control via in-process `AXUIElementPerformAction`, or via `MouseInjection` when the request asks for `"via":"click"` |
+| `DebugRPCServer+UIType.swift` | `POST /ui/type` handler — focuses an allowlisted text field and fills it via `KeyboardInjection` (plain text fields only, never a `SecureField`) |
+| `DebugRPCServer+AXElement.swift` | Shared self-pid `AXUIElement` tree walk backing `/ui/tree`, `/ui/press`, and `/ui/type` |
+| `KeyboardInjection.swift` | Posts real key events into the app's own UI (`NSWindow.sendEvent`) so a SwiftUI `TextField` binding observes the input — backs `POST /ui/type` |
+| `MouseInjection.swift` | Posts a real mouse click into the app's own UI (`NSApplication.postEvent`) for controls where an AX press reports success without acting — backs `POST /ui/press` `"via":"click"` |
 | `HTTPRequest.swift` | Minimal HTTP/1.1 request parsing for `DebugRPCServer` (pure value type, line-cap split) |
 | `HTTPResponse.swift` | Minimal HTTP/1.1 response serialization for `DebugRPCServer` (pure value type, line-cap split) |
 | `RPCResourceMetrics.swift` | JSON-serializable resource-usage snapshot of the running process, backs `GET /metrics` |
@@ -562,7 +567,7 @@ AppSettings (UserDefaults)
 | LiveCaptionsGate.strategy | Pure static function — call directly with any input combination, no controller needed |
 | AppNotifying | `notifier` parameter in `AppState.init` (`SilentNotifier` default, `RecordingNotifier` in tests) |
 | BadgeKind.compute | Pure static function — call directly with any input combination, no WatchLoop needed |
-| DebugRPCServer | Out-of-process inspection via HTTP. Debug endpoints: `GET /state /healthz /metrics /screenshot`, `POST /action/openSettings /action/closeSettings`. Versioned automation API under `/v1` (`POST /v1/transcribe`, `POST /v1/jobs`, `GET /v1/jobs/<id>`, `GET`/`POST /v1/jobs/<id>/naming`, `POST /v1/jobs/<id>/naming/skip`); see `docs/automation-api.md`. `#if !APPSTORE` + env-gated. `boundPort` exposes OS-assigned port for in-process integration tests. `tools/mt-cli/` is the matching inspection CLI. `scripts/test_rpc.sh` is a live smoketest (build + launch + drive + assert). |
+| DebugRPCServer | Out-of-process inspection via HTTP. Debug endpoints: `GET /state /healthz /metrics /screenshot /ui/tree`, `POST /action/openSettings /action/closeSettings /ui/press /ui/type`. Versioned automation API under `/v1` (`POST /v1/transcribe`, `POST /v1/jobs`, `GET /v1/jobs/<id>`, `GET`/`POST /v1/jobs/<id>/naming`, `POST /v1/jobs/<id>/naming/skip`); see `docs/automation-api.md`. `#if !APPSTORE` + env-gated. `boundPort` exposes OS-assigned port for in-process integration tests. `tools/mt-cli/` is the matching inspection CLI. `scripts/test_rpc.sh` is a live smoketest (build + launch + drive + assert). |
 
 ---
 
