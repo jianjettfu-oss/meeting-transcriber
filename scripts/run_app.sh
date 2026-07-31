@@ -2,10 +2,15 @@
 # Launch the Meeting Transcriber menu bar app.
 # Builds an .app bundle so macOS APIs (notifications, etc.) work correctly.
 #
-# --build-only: Build the bundle but skip `open -W`. Used by the Pattern-C
-#   E2E driver (scripts/e2e-app.sh) which deploys the bundle to a stable
-#   path and launches it itself; opening the in-tree bundle there would
-#   confuse macOS LaunchServices about which one to use for TCC.
+# Build happens in-tree under .build/; the LAUNCH always happens from the
+# canonical deploy path ~/Applications/MeetingTranscriber-Dev.app, the same
+# one scripts/e2e-*.sh use. Launching the in-tree bundle instead would give
+# LaunchServices a second copy to arbitrate over, and would anchor the app's
+# identity inside a directory that `swift package clean` deletes.
+#
+# --build-only: build + sign in-tree, skip deploy + launch. Used by the
+#   Pattern-C E2E driver (scripts/e2e-app.sh), which does its own deploy to
+#   the same canonical path and launches it itself.
 
 set -euo pipefail
 
@@ -28,6 +33,11 @@ APP_BUNDLE="$SPM_DIR/.build/MeetingTranscriber-Dev.app"
 APP_MACOS="$APP_BUNDLE/Contents/MacOS"
 APP_BINARY="$APP_MACOS/MeetingTranscriber"
 INFO_PLIST="$SPM_DIR/Sources/Info.plist"
+# Canonical deploy path — same constant as scripts/e2e-*.sh's DEV_BUNDLE_DEPLOY,
+# so a manual launch and an e2e run share ONE bundle (and therefore one set of
+# TCC grants). ~/Applications rather than /Applications because it needs no
+# admin rights, which is what the self-hosted runner user has.
+DEV_BUNDLE_DEPLOY="$HOME/Applications/MeetingTranscriber-Dev.app"
 
 # Always rebuild to pick up code changes
 echo "Building Meeting Transcriber app..."
@@ -99,45 +109,74 @@ else
     SIGN_HASH="-"
     SIGN_DESC="ad-hoc (no codesigning identity in keychain)"
 fi
-echo "  Signing: $SIGN_DESC"
-codesign --force --sign "$SIGN_HASH" "$APP_BUNDLE" || {
-    echo "ERROR: codesign failed ($SIGN_DESC)." >&2
-    echo "       Refusing to launch: an unsigned bundle gets no notification" >&2
-    echo "       permission and no stable TCC grant." >&2
-    exit 1
+# Sign one bundle and assert the result. Applied to the in-tree bundle and
+# again to the deployed copy: rsync carries the signature over, but re-signing
+# at the destination is what keeps `codesign --verify` meaningful there.
+sign_and_verify() {
+    local bundle="$1" info
+    echo "  Signing ($SIGN_DESC): $bundle"
+    codesign --force --sign "$SIGN_HASH" "$bundle" || {
+        echo "ERROR: codesign failed ($SIGN_DESC) for $bundle." >&2
+        echo "       Refusing to continue: an unsigned bundle gets no" >&2
+        echo "       notification permission and no stable TCC grant." >&2
+        exit 1
+    }
+    # `codesign --sign` exiting 0 is a receipt, not evidence — assert the two
+    # properties a linker-signed bundle lacks (sealed resources, and an
+    # identifier that is the bundle ID rather than the linker's default binary
+    # name).
+    codesign --verify "$bundle" || {
+        echo "ERROR: codesign --verify failed for $bundle" >&2
+        exit 1
+    }
+    info=$(codesign -dv --verbose=2 "$bundle" 2>&1)
+    grep -q '^Sealed Resources' <<<"$info" || {
+        echo "ERROR: no sealed resources after signing $bundle — Info.plist is" >&2
+        echo "       unbound, so notifications will not work. codesign -dv said:" >&2
+        echo "$info" >&2
+        exit 1
+    }
+    grep -q '^Identifier=com\.meetingtranscriber\.dev$' <<<"$info" || {
+        echo "ERROR: signed identifier is not com.meetingtranscriber.dev —" >&2
+        echo "       $(grep '^Identifier=' <<<"$info")" >&2
+        exit 1
+    }
+    echo "  Signed OK: $(grep '^Sealed Resources' <<<"$info")"
 }
 
-# Verify the signature took. `codesign --sign` exiting 0 is a receipt, not
-# evidence — assert the two properties a linker-signed bundle lacks (sealed
-# resources, and an identifier that is the bundle ID rather than the linker's
-# default binary name).
-codesign --verify "$APP_BUNDLE" || {
-    echo "ERROR: codesign --verify failed for $APP_BUNDLE" >&2
-    exit 1
-}
-SIGN_INFO=$(codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1)
-grep -q '^Sealed Resources' <<<"$SIGN_INFO" || {
-    echo "ERROR: no sealed resources after signing — Info.plist is unbound," >&2
-    echo "       so notifications will not work. codesign -dv said:" >&2
-    echo "$SIGN_INFO" >&2
-    exit 1
-}
-grep -q '^Identifier=com\.meetingtranscriber\.dev$' <<<"$SIGN_INFO" || {
-    echo "ERROR: signed identifier is not com.meetingtranscriber.dev —" >&2
-    echo "       $(grep '^Identifier=' <<<"$SIGN_INFO")" >&2
-    exit 1
-}
-echo "  Signed OK: $(grep '^Sealed Resources' <<<"$SIGN_INFO")"
+sign_and_verify "$APP_BUNDLE"
 
 if [ "$BUILD_ONLY" = true ]; then
     echo "Bundle ready: $APP_BUNDLE"
     exit 0
 fi
 
+# Deploy to the canonical path before launching. rsync into the EXISTING
+# directory rather than delete+recreate: LaunchServices re-registers a
+# recreated bundle from scratch, and a half-registered app is a worse failure
+# than a stale one. TCC itself keys on the bundle ID + code-signing
+# requirement, not the path (verified 2026-07-31: the same signed bundle moved
+# between /Applications and ~/Applications kept all four grants), so the
+# constant path is about LaunchServices and about humans being able to tell
+# which copy is running — not about preserving permissions.
+echo "Deploying to $DEV_BUNDLE_DEPLOY"
+mkdir -p "$(dirname "$DEV_BUNDLE_DEPLOY")"
+if [ -d "$DEV_BUNDLE_DEPLOY" ]; then
+    rsync -a --delete "$APP_BUNDLE/" "$DEV_BUNDLE_DEPLOY/"
+else
+    cp -R "$APP_BUNDLE" "$DEV_BUNDLE_DEPLOY"
+fi
+sign_and_verify "$DEV_BUNDLE_DEPLOY"
+
 echo "Starting Meeting Transcriber..."
-echo "  TRANSCRIBER_ROOT=$TRANSCRIBER_ROOT"
+echo "  bundle=$DEV_BUNDLE_DEPLOY"
 
 # Launch via `open` so macOS LaunchServices properly registers the app
-# (required for notification permissions, etc.).
-# The app discovers the project root by walking up from the executable.
-open -W "$APP_BUNDLE"
+# (required for notification permissions, etc.), and from the deployed copy
+# rather than the in-tree one so there is exactly one registered bundle.
+#
+# The app does NOT need the project tree at runtime: every path it uses comes
+# from AppPaths (~/Library/Application Support/MeetingTranscriber), and no
+# Swift source reads TRANSCRIBER_ROOT — it is script-local. (`open` would not
+# pass the exported value through LaunchServices anyway.)
+open -W "$DEV_BUNDLE_DEPLOY"
